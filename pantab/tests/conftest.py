@@ -1,7 +1,9 @@
+import decimal
 import pathlib
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 import tableauhyperapi as tab_api
 
@@ -139,6 +141,16 @@ def get_basic_dataframe():
             "non-ascii": "string",
         }
     )
+
+    df["decimal"] = pa.array(
+        [
+            decimal.Decimal("123.456"),
+            decimal.Decimal("-123.456"),
+            decimal.Decimal("2343897234873987234987.874874"),
+        ],
+        type=pa.decimal128(38, 8),
+    )
+    df["decimal"] = df["decimal"].astype(pd.ArrowDtype(pa.decimal128(38, 8)))
 
     return df
 

@@ -12,6 +12,7 @@
 #include <nanobind/stl/tuple.h>
 
 #include "datetime.h"
+#include "nanoarrow/nanoarrow_types.h"
 #include "numpy_datetime.h"
 
 namespace nb = nanobind;
@@ -38,6 +39,9 @@ static auto hyperTypeFromArrowSchema(struct ArrowSchema *schema,
   case NANOARROW_TYPE_FLOAT:
   case NANOARROW_TYPE_DOUBLE:
     return hyperapi::SqlType::doublePrecision();
+  case NANOARROW_TYPE_DECIMAL128:
+    return hyperapi::SqlType::numeric(schema_view.decimal_precision,
+                                      schema_view.decimal_scale);
   case NANOARROW_TYPE_BOOL:
     return hyperapi::SqlType::boolean();
   case NANOARROW_TYPE_STRING:
@@ -120,6 +124,29 @@ public:
       hyperapi::internal::ValueInserter{*inserter_}.addNull();
       return;
     }
+
+    const double value = ArrowArrayViewGetDoubleUnsafe(&array_view_, idx);
+    hyperapi::internal::ValueInserter{*inserter_}.addValue(
+        static_cast<T>(value));
+  }
+};
+
+class DecimalInsertHelper : public InsertHelper {
+public:
+  using InsertHelper::InsertHelper;
+
+  void insertValueAtIndex(size_t idx) override {
+    if (ArrowArrayViewIsNull(&array_view_, idx)) {
+      // MSVC on cibuildwheel doesn't like this templated optional
+      // inserter_->add(std::optional<T>{std::nullopt});
+      hyperapi::internal::ValueInserter{*inserter_}.addNull();
+      return;
+    }
+
+    ArrowDecimal decimal;
+    // TODO: pass from parent
+    ArrowDecimalInit(&decimal, 128, 38, 8);
+    ArrowArrayViewGetDecimalUnsafe(array_view_, idx, &decimal);
 
     const double value = ArrowArrayViewGetDoubleUnsafe(&array_view_, idx);
     hyperapi::internal::ValueInserter{*inserter_}.addValue(
