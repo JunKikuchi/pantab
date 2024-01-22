@@ -172,13 +172,9 @@ public:
     ArrowDecimalInit(&decimal, 128, 38, 8);
     ArrowArrayViewGetDecimalUnsafe(&array_view_, idx, &decimal);
 
-    const double value = ArrowArrayViewGetDoubleUnsafe(&array_view_, idx);
-
-    // bitcast would probably be more appropriate with C++20
-    hyperapi::internal::ValueInserter{*inserter_}.addValue(
-        static_cast<int64_t>(decimal.words[0]));
-    hyperapi::internal::ValueInserter{*inserter_}.addValue(
-        static_cast<int64_t>(decimal.words[1]));
+    hyper_data128_t result;
+    memcpy(result.data, &decimal.words, sizeof(hyper_data128_t));
+    hyperapi::internal::ValueInserter{*inserter_}.addValue(result);
   }
 };
 
