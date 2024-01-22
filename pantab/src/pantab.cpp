@@ -44,6 +44,9 @@ static auto hyperTypeFromArrowSchema(struct ArrowSchema *schema,
                                       schema_view.decimal_scale);
   case NANOARROW_TYPE_BOOL:
     return hyperapi::SqlType::boolean();
+  case NANOARROW_TYPE_BINARY:
+  case NANOARROW_TYPE_LARGE_BINARY:
+    return hyperapi::SqlType::bytes();
   case NANOARROW_TYPE_STRING:
   case NANOARROW_TYPE_LARGE_STRING:
     return hyperapi::SqlType::text();
@@ -55,6 +58,8 @@ static auto hyperTypeFromArrowSchema(struct ArrowSchema *schema,
     } else {
       return hyperapi::SqlType::timestamp();
     }
+  case NANOARROW_TYPE_TIME64:
+    return hyperapi::SqlType::time();
   default:
     throw std::invalid_argument("Unsupported Arrow type: " +
                                 std::to_string(schema_view.type));
@@ -131,6 +136,25 @@ public:
   }
 };
 
+class BinaryInsertHelper : public InsertHelper {
+public:
+  using InsertHelper::InsertHelper;
+
+  void insertValueAtIndex(size_t idx) override {
+    if (ArrowArrayViewIsNull(&array_view_, idx)) {
+      // MSVC on cibuildwheel doesn't like this templated optional
+      hyperapi::internal::ValueInserter{*inserter_}.addNull();
+      return;
+    }
+
+    const struct ArrowBufferView buffer_view =
+        ArrowArrayViewGetBytesUnsafe(&array_view_, idx);
+    const hyperapi::ByteSpan result{
+        buffer_view.data.as_uint8, static_cast<size_t>(buffer_view.size_bytes)};
+    hyperapi::internal::ValueInserter{*inserter_}.addValue(result);
+  }
+};
+
 class DecimalInsertHelper : public InsertHelper {
 public:
   using InsertHelper::InsertHelper;
@@ -146,11 +170,15 @@ public:
     ArrowDecimal decimal;
     // TODO: pass from parent
     ArrowDecimalInit(&decimal, 128, 38, 8);
-    ArrowArrayViewGetDecimalUnsafe(array_view_, idx, &decimal);
+    ArrowArrayViewGetDecimalUnsafe(&array_view_, idx, &decimal);
 
     const double value = ArrowArrayViewGetDoubleUnsafe(&array_view_, idx);
+
+    // bitcast would probably be more appropriate with C++20
     hyperapi::internal::ValueInserter{*inserter_}.addValue(
-        static_cast<T>(value));
+        static_cast<int64_t>(decimal.words[0]));
+    hyperapi::internal::ValueInserter{*inserter_}.addValue(
+        static_cast<int64_t>(decimal.words[1]));
   }
 };
 
@@ -168,8 +196,13 @@ public:
 
     const struct ArrowBufferView buffer_view =
         ArrowArrayViewGetBytesUnsafe(&array_view_, idx);
+#if defined(_WIN32) && defined(_MSC_VER)
     const auto result = std::string{
         buffer_view.data.as_char, static_cast<size_t>(buffer_view.size_bytes)};
+#else
+    const auto result = std::string_view{
+        buffer_view.data.as_char, static_cast<size_t>(buffer_view.size_bytes)};
+#endif
     hyperapi::internal::ValueInserter{*inserter_}.addValue(result);
   }
 };
@@ -306,6 +339,10 @@ static auto makeInsertHelper(std::shared_ptr<hyperapi::Inserter> inserter,
   case NANOARROW_TYPE_BOOL:
     return std::unique_ptr<InsertHelper>(new IntegralInsertHelper<bool>(
         inserter, chunk, schema, error, column_position));
+  case NANOARROW_TYPE_BINARY:
+  case NANOARROW_TYPE_LARGE_BINARY:
+    return std::unique_ptr<InsertHelper>(new BinaryInsertHelper(
+        inserter, chunk, schema, error, column_position));
   case NANOARROW_TYPE_STRING:
   case NANOARROW_TYPE_LARGE_STRING:
     return std::unique_ptr<InsertHelper>(new Utf8InsertHelper<int64_t>(
@@ -358,6 +395,15 @@ static auto makeInsertHelper(std::shared_ptr<hyperapi::Inserter> inserter,
     }
     throw std::runtime_error(
         "This code block should not be hit - contact a developer");
+  case NANOARROW_TYPE_TIME64:
+    switch (schema_view.time_unit) {
+    case NANOARROW_TIME_UNIT_MICRO:
+      return std::unique_ptr<InsertHelper>(new IntegralInsertHelper<int64_t>(
+          inserter, chunk, schema, error, column_position));
+    default:
+      throw std::invalid_argument(
+          "Only microsecond-precision timestamp writes are implemented!");
+    }
   default:
     throw std::invalid_argument("makeInsertHelper: Unsupported Arrow type: " +
                                 std::to_string(schema_view.type));
@@ -405,11 +451,13 @@ void write_to_hyper(
     for (int64_t i = 0; i < schema.n_children; i++) {
       const auto hypertype =
           hyperTypeFromArrowSchema(schema.children[i], &error);
-      const auto name = std::string{schema.children[i]->name};
 
       // Almost all arrow types are nullable
-      hyper_columns.emplace_back(hyperapi::TableDefinition::Column{
-          name, hypertype, hyperapi::Nullability::Nullable});
+      const hyperapi::TableDefinition::Column column{
+          std::string(schema.children[i]->name), hypertype,
+          hyperapi::Nullability::Nullable};
+
+      hyper_columns.emplace_back(std::move(column));
     }
 
     const hyperapi::TableName table_name{hyper_schema, hyper_table};
@@ -464,7 +512,7 @@ protected:
   struct ArrowArray *array_;
 };
 
-class IntegralReadHelper : public ReadHelper {
+template <typename T> class IntegralReadHelper : public ReadHelper {
   using ReadHelper::ReadHelper;
 
   auto Read(const hyperapi::Value &value) -> void override {
@@ -474,7 +522,7 @@ class IntegralReadHelper : public ReadHelper {
       }
       return;
     }
-    if (ArrowArrayAppendInt(array_, value.get<int64_t>())) {
+    if (ArrowArrayAppendInt(array_, value.get<T>())) {
       throw std::runtime_error("ArrowAppendInt failed");
     };
   }
@@ -512,6 +560,29 @@ class BooleanReadHelper : public ReadHelper {
   }
 };
 
+class BytesReadHelper : public ReadHelper {
+  using ReadHelper::ReadHelper;
+
+  auto Read(const hyperapi::Value &value) -> void override {
+    if (value.isNull()) {
+      if (ArrowArrayAppendNull(array_, 1)) {
+        throw std::runtime_error("ArrowAppendNull failed");
+      }
+      return;
+    }
+
+    // TODO: we can use the non-owning hyperapi::ByteSpan template type but
+    // there is a bug in that header file that needs an upstream fix first
+    const auto bytes = value.get<std::vector<uint8_t>>();
+    const ArrowBufferView arrow_buffer_view{bytes.data(),
+                                            static_cast<int64_t>(bytes.size())};
+
+    if (ArrowArrayAppendBytes(array_, arrow_buffer_view)) {
+      throw std::runtime_error("ArrowAppendString failed");
+    };
+  }
+};
+
 class StringReadHelper : public ReadHelper {
   using ReadHelper::ReadHelper;
 
@@ -523,9 +594,15 @@ class StringReadHelper : public ReadHelper {
       return;
     }
 
+#if defined(_WIN32) && defined(_MSC_VER)
     const auto strval = value.get<std::string>();
     const ArrowStringView arrow_string_view{
         strval.c_str(), static_cast<int64_t>(strval.size())};
+#else
+    const auto strval = value.get<std::string_view>();
+    const ArrowStringView arrow_string_view{
+        strval.data(), static_cast<int64_t>(strval.size())};
+#endif
 
     if (ArrowArrayAppendString(array_, arrow_string_view)) {
       throw std::runtime_error("ArrowAppendString failed");
@@ -601,16 +678,40 @@ template <bool TZAware> class DatetimeReadHelper : public ReadHelper {
   }
 };
 
+class TimeReadHelper : public ReadHelper {
+  using ReadHelper::ReadHelper;
+
+  auto Read(const hyperapi::Value &value) -> void override {
+    if (value.isNull()) {
+      if (ArrowArrayAppendNull(array_, 1)) {
+        throw std::runtime_error("ArrowAppendNull failed");
+      }
+      return;
+    }
+    const auto time = value.get<hyperapi::Time>();
+    const auto raw_value = time.getRaw();
+    if (ArrowArrayAppendInt(array_, raw_value)) {
+      throw std::runtime_error("ArrowAppendInt failed");
+    };
+  }
+};
+
 static auto makeReadHelper(const ArrowSchemaView *schema_view,
                            struct ArrowArray *array)
     -> std::unique_ptr<ReadHelper> {
   switch (schema_view->type) {
   case NANOARROW_TYPE_INT16:
+    return std::unique_ptr<ReadHelper>(new IntegralReadHelper<int16_t>(array));
   case NANOARROW_TYPE_INT32:
+    return std::unique_ptr<ReadHelper>(new IntegralReadHelper<int32_t>(array));
   case NANOARROW_TYPE_INT64:
-    return std::unique_ptr<ReadHelper>(new IntegralReadHelper(array));
+    return std::unique_ptr<ReadHelper>(new IntegralReadHelper<int64_t>(array));
+  case NANOARROW_TYPE_UINT32:
+    return std::unique_ptr<ReadHelper>(new IntegralReadHelper<uint32_t>(array));
   case NANOARROW_TYPE_DOUBLE:
     return std::unique_ptr<ReadHelper>(new FloatReadHelper(array));
+  case NANOARROW_TYPE_LARGE_BINARY:
+    return std::unique_ptr<ReadHelper>(new BytesReadHelper(array));
   case NANOARROW_TYPE_LARGE_STRING:
     return std::unique_ptr<ReadHelper>(new StringReadHelper(array));
   case NANOARROW_TYPE_BOOL:
@@ -623,6 +724,8 @@ static auto makeReadHelper(const ArrowSchemaView *schema_view,
     } else {
       return std::unique_ptr<ReadHelper>(new DatetimeReadHelper<false>(array));
     }
+  case NANOARROW_TYPE_TIME64:
+    return std::unique_ptr<ReadHelper>(new TimeReadHelper(array));
   default:
     throw nb::type_error("unknownn arrow type provided");
   }
@@ -634,13 +737,17 @@ static auto arrowTypeFromHyper(const hyperapi::SqlType &sqltype)
         case hyperapi::TypeTag::SmallInt : return NANOARROW_TYPE_INT16;
         case hyperapi::TypeTag::Int : return NANOARROW_TYPE_INT32;
         case hyperapi::TypeTag::BigInt : return NANOARROW_TYPE_INT64;
+        case hyperapi::TypeTag::Oid : return NANOARROW_TYPE_UINT32;
         case hyperapi::TypeTag::Double : return NANOARROW_TYPE_DOUBLE;
-        case hyperapi::TypeTag::Varchar : case hyperapi::TypeTag::Char :
-            case hyperapi::TypeTag::Text : return NANOARROW_TYPE_LARGE_STRING;
+        case hyperapi::TypeTag::Bytes : return NANOARROW_TYPE_LARGE_BINARY;
+        case hyperapi::TypeTag::Varchar : case hyperapi::TypeTag::
+        Char : case hyperapi::TypeTag::Text : case hyperapi::TypeTag::
+        Json : return NANOARROW_TYPE_LARGE_STRING;
         case hyperapi::TypeTag::Bool : return NANOARROW_TYPE_BOOL;
         case hyperapi::TypeTag::Date : return NANOARROW_TYPE_DATE32;
         case hyperapi::TypeTag::Timestamp : case hyperapi::TypeTag::
         TimestampTZ : return NANOARROW_TYPE_TIMESTAMP;
+        case hyperapi::TypeTag::Time : return NANOARROW_TYPE_TIME64;
         default : throw nb::type_error(
             ("Reader not implemented for type: " + sqltype.toString()).c_str());
       }
@@ -683,19 +790,30 @@ auto read_from_hyper_query(const std::string &path, const std::string &query)
     }
 
     const auto sqltype = column.getType();
-    if (sqltype.getTag() == hyperapi::TypeTag::TimestampTZ) {
+    switch (sqltype.getTag()) {
+    case hyperapi::TypeTag::TimestampTZ:
       if (ArrowSchemaSetTypeDateTime(schema->children[i],
                                      NANOARROW_TYPE_TIMESTAMP,
                                      NANOARROW_TIME_UNIT_MICRO, "UTC")) {
-        throw std::runtime_error("ArrowSchemaSetDateTime failed");
+        throw std::runtime_error(
+            "ArrowSchemaSetDateTime failed for TimestampTZ type");
       }
-    } else if (sqltype.getTag() == hyperapi::TypeTag::Timestamp) {
+      break;
+    case hyperapi::TypeTag::Timestamp:
       if (ArrowSchemaSetTypeDateTime(schema->children[i],
                                      NANOARROW_TYPE_TIMESTAMP,
                                      NANOARROW_TIME_UNIT_MICRO, nullptr)) {
-        throw std::runtime_error("ArrowSchemaSetDateTime failed");
+        throw std::runtime_error(
+            "ArrowSchemaSetDateTime failed for Timestamp type");
       }
-    } else {
+      break;
+    case hyperapi::TypeTag::Time:
+      if (ArrowSchemaSetTypeDateTime(schema->children[i], NANOARROW_TYPE_TIME64,
+                                     NANOARROW_TIME_UNIT_MICRO, nullptr)) {
+        throw std::runtime_error("ArrowSchemaSetDateTime failed for Time type");
+      }
+      break;
+    default:
       const enum ArrowType arrow_type = arrowTypeFromHyper(sqltype);
       if (ArrowSchemaSetType(schema->children[i], arrow_type)) {
         throw std::runtime_error("ArrowSchemaSetType failed");

@@ -142,6 +142,11 @@ def get_basic_dataframe():
         }
     )
 
+    # See pandas GH issue #56994
+    df["binary"] = pa.array([b"\xde\xad\xbe\xef", b"\xff\xee", None], type=pa.binary())
+    df["binary"] = df["binary"].astype("binary[pyarrow]")
+    df["time64us"] = pd.DataFrame({"col": pa.array([234, 42], type=pa.time64("us"))})
+    df["time64us"] = df["time64us"].astype("time64[us][pyarrow]")
     df["decimal"] = pa.array(
         [
             decimal.Decimal("123.456"),
@@ -190,6 +195,8 @@ def roundtripped():
             "float64_limits": "double[pyarrow]",
             "non-ascii": "large_string[pyarrow]",
             "string": "large_string[pyarrow]",
+            "binary": "large_binary[pyarrow]",
+            "time64us": "time64[us][pyarrow]",
         }
     )
     return df
