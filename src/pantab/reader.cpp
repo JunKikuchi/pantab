@@ -65,6 +65,36 @@ class FloatReadHelper : public ReadHelper {
   }
 };
 
+template <unsigned int precision_value, unsigned int scale_value>
+class NumericReadHelper : public ReadHelper {
+  using ReadHelper::ReadHelper;
+
+  auto Read(const hyperapi::Value &value) -> void override {
+    if (value.isNull()) {
+      if (ArrowArrayAppendNull(array_, 1)) {
+        throw std::runtime_error("ArrowAppendNull failed");
+      }
+      return;
+    }
+
+    const auto numstr =
+        value.get < hyperapi::Numeric<precision_value, scale_value>();
+    const struct ArrowStringView sv {
+      numstr.data(), static_cast<int64_t>(numstr.size())
+    };
+
+    struct ArrowDecimal decimal;
+    ArrowDecimalInit(&decimal, 128, precision_value, scale_value);
+    if (ArrowDecimalSetDigits(&decimal, sv)) {
+      throw std::runtime_error("ArrowDecimalSetDigits failed");
+    }
+
+    if (ArrowArrayAppendDecimal(array_, &decimal)) {
+      throw std::runtime_error("ArrowArrayAppendDecimal failed");
+    }
+  }
+};
+
 class BooleanReadHelper : public ReadHelper {
   using ReadHelper::ReadHelper;
 
@@ -284,6 +314,14 @@ static auto MakeReadHelper(const ArrowSchemaView *schema_view,
   }
 }
 
+template <unsigned int precision_value, unsigned int scale_value>
+static auto MakeDecimalReadHelper(const ArrowSchemaView *schema_view,
+                                  struct ArrowArray *array)
+    -> std::unique_ptr<ReadHelper> {
+  return std::unique_ptr<ReadHelper>(new NumericReadHelper < precision_value,
+                                     scale_value)(array);
+}
+
 static auto GetArrowTypeFromHyper(const hyperapi::SqlType &sqltype)
     -> enum ArrowType {
       switch (sqltype.getTag()){
@@ -331,6 +369,12 @@ static auto SetSchemaTypeFromHyperType(struct ArrowSchema *schema,
     if (ArrowSchemaSetTypeDateTime(schema, NANOARROW_TYPE_TIME64,
                                    NANOARROW_TIME_UNIT_MICRO, nullptr)) {
       throw std::runtime_error("ArrowSchemaSetDateTime failed for Time type");
+    }
+    break;
+  case hyperapi::TypeTag::Numeric:
+    if (ArrowSchemaSetTypeDecimal(schema, NANOARROW_TYPE_DECIMAL128,
+                                  sqltype.getPrecision(), sqltype.getScale())) {
+      throw std::runtime_error("ArrowSchemaSetDecimal failed for Decimal type");
     }
     break;
   default:
@@ -399,8 +443,17 @@ auto read_from_hyper_query(const std::string &path, const std::string &query)
       throw std::runtime_error("ArrowSchemaViewInit failed");
     }
 
-    auto read_helper = MakeReadHelper(&schema_view, array->children[i]);
-    read_helpers[i] = std::move(read_helper);
+    // Need to special case decimals to ensure constexpr attributes can be
+    // forwarded
+    if (schema_view->type == NANOARROW_TYPE_DECIMAL128) {
+      const auto column = resultSchema.getColumn(i);
+      auto read_helper = MakeDecimalReadHelper<column.precision, column.scale>(
+          &schema_view, array->children[i]);
+      read_helpers[i] = std::move(read_helper);
+    } else {
+      auto read_helper = MakeReadHelper(&schema_view, array->children[i]);
+      read_helpers[i] = std::move(read_helper);
+    }
   }
 
   if (ArrowArrayStartAppending(array.get())) {
